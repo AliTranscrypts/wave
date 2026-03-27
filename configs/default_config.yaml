@@ -1,0 +1,60 @@
+world:
+  origin: [0.0, 0.0, 0.0]
+  x_min: -2500.0
+  x_max: 2500.0
+  y_min: -2500.0
+  y_max: 2500.0
+  z_min: 0.0
+  z_max: 500.0
+
+eagle:
+  temperature: 35.0
+  radius: 0.5
+  max_speed: 20.0
+  max_acceleration: 5.0
+  motion_type: lissajous
+  altitude_range: [50.0, 200.0]
+  lissajous_amplitudes: [300.0, 300.0, 30.0]
+  lissajous_frequencies: [0.05, 0.07, 0.03]
+  lissajous_phases: [0.0, 1.57, 0.0]
+  lissajous_z_center: 100.0
+  initial_position: [0.0, 0.0, 100.0]
+
+cameras:
+  - id: cam_00
+    position: [500.0, 0.0, 10.0]
+    orientation_mode: look_at
+    look_at_target: [0.0, 0.0, 100.0]
+    intrinsics_preset: flir_640x512
+    hfov_deg: 45.0
+  - id: cam_01
+    position: [-250.0, 433.0, 10.0]
+    orientation_mode: look_at
+    look_at_target: [0.0, 0.0, 100.0]
+    intrinsics_preset: flir_640x512
+    hfov_deg: 45.0
+  - id: cam_02
+    position: [-250.0, -433.0, 10.0]
+    orientation_mode: look_at
+    look_at_target: [0.0, 0.0, 100.0]
+    intrinsics_preset: flir_640x512
+    hfov_deg: 45.0
+
+rendering:
+  sky_temperature: -10.0
+  ground_temperature: 15.0
+  atmospheric_attenuation_coeff: 0.0005
+  vignetting_strength: 0.0
+  blur_sigma_pixels: 2.0
+  rendering_method: projection
+  noise:
+    enabled: false
+    gaussian_std: 0.05
+    shot_noise_enabled: false
+    fixed_pattern_noise_std: 0.0
+    random_seed: 42
+
+run:
+  num_frames: 100
+  dt: 0.1
+  random_seed: 42
