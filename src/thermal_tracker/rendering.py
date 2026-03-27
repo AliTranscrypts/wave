@@ -225,17 +225,26 @@ def render_frame(
     camera: Camera,
     config: RenderingConfig,
     rng: np.random.Generator,
+    extra_eagles: list[EagleState] | None = None,
 ) -> np.ndarray:
-    """Render one complete thermal frame for a single camera."""
+    """Render one complete thermal frame for a single camera.
+
+    Supports multiple eagles: pass additional eagles via extra_eagles.
+    """
     W, H = camera.intrinsics.width, camera.intrinsics.height
 
     # 1. Background
     image = generate_background(W, H, config)
 
-    # 2. Project and render eagle blob
-    proj = project_eagle(eagle_state, camera)
-    if proj["is_visible"]:
-        image = render_thermal_blob(image, proj, eagle_state, config)
+    # 2. Project and render all eagle blobs (additive)
+    all_eagles = [eagle_state]
+    if extra_eagles:
+        all_eagles.extend(extra_eagles)
+
+    for eagle in all_eagles:
+        proj = project_eagle(eagle, camera)
+        if proj["is_visible"]:
+            image = render_thermal_blob(image, proj, eagle, config)
 
     # 3. Vignetting
     if camera.vignetting_map is not None:
@@ -252,11 +261,12 @@ def render_all_cameras(
     cameras: list[Camera],
     config: RenderingConfig,
     camera_rngs: list[np.random.Generator],
+    extra_eagles: list[EagleState] | None = None,
 ) -> dict[str, np.ndarray]:
     """Render thermal images for all cameras at the same timestamp."""
     images = {}
     for cam, rng in zip(cameras, camera_rngs):
-        images[cam.id] = render_frame(eagle_state, cam, config, rng)
+        images[cam.id] = render_frame(eagle_state, cam, config, rng, extra_eagles)
     return images
 
 
@@ -274,3 +284,6 @@ class FrameBundle:
     ground_truth_velocity: np.ndarray = field(default_factory=lambda: np.zeros(3))
     ground_truth_2d: dict[str, np.ndarray] = field(default_factory=dict)
     visibility: dict[str, bool] = field(default_factory=dict)
+    # Multi-eagle ground truth: list of (position, velocity) per eagle
+    all_eagle_positions: list[np.ndarray] = field(default_factory=list)
+    all_eagle_velocities: list[np.ndarray] = field(default_factory=list)
