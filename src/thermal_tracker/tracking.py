@@ -17,10 +17,16 @@ from thermal_tracker.clustering import VoxelCluster
 # ---------------------------------------------------------------------------
 
 class KalmanFilter3D:
-    """6-state (pos + vel) constant-velocity Kalman filter."""
+    """6-state (pos + vel) constant-velocity Kalman filter with safety bounds."""
 
-    def __init__(self, dt: float, q: float = 5.0, r: float = 0.5):
+    def __init__(self, dt: float, q: float = 5.0, r: float = 0.5,
+                 max_velocity: float = 50.0,
+                 bounds_min: np.ndarray | None = None,
+                 bounds_max: np.ndarray | None = None):
         self.dt = dt
+        self.max_velocity = max_velocity
+        self.bounds_min = bounds_min  # (3,) world-space position clamp
+        self.bounds_max = bounds_max
         self.state = np.zeros(6)
         self.P = np.eye(6) * 100.0
 
@@ -49,9 +55,10 @@ class KalmanFilter3D:
         self.P = np.diag([self.R[0, 0], self.R[1, 1], self.R[2, 2], 100.0, 100.0, 100.0])
 
     def predict(self) -> np.ndarray:
-        """Predict step. Returns predicted position."""
+        """Predict step. Returns predicted position. Clamps velocity and position."""
         self.state = self.F @ self.state
         self.P = self.F @ self.P @ self.F.T + self.Q
+        self._clamp_state()
         return self.H @ self.state
 
     def update(self, measurement: np.ndarray) -> np.ndarray:
@@ -61,7 +68,44 @@ class KalmanFilter3D:
         K = self.P @ self.H.T @ np.linalg.inv(S)  # Kalman gain
         self.state = self.state + K @ y
         self.P = (np.eye(6) - K @ self.H) @ self.P
+        self._clamp_state()
         return self.H @ self.state
+
+    def innovation_distance(self, measurement: np.ndarray) -> float:
+        """Mahalanobis distance of a measurement from the predicted state.
+
+        Used for gating: reject associations with distance > threshold.
+        """
+        y = measurement - self.H @ self.state
+        S = self.H @ self.P @ self.H.T + self.R
+        try:
+            d = float(np.sqrt(y @ np.linalg.inv(S) @ y))
+        except np.linalg.LinAlgError:
+            d = float(np.linalg.norm(y))
+        return d
+
+    def is_position_in_bounds(self) -> bool:
+        """Check if the current predicted position is within configured bounds."""
+        pos = self.state[:3]
+        if self.bounds_min is not None and np.any(pos < self.bounds_min):
+            return False
+        if self.bounds_max is not None and np.any(pos > self.bounds_max):
+            return False
+        return True
+
+    def _clamp_state(self) -> None:
+        """Clamp velocity to max_velocity and position to bounds."""
+        # Velocity clamping
+        vel = self.state[3:]
+        speed = np.linalg.norm(vel)
+        if speed > self.max_velocity:
+            self.state[3:] = vel * self.max_velocity / speed
+
+        # Position clamping
+        if self.bounds_min is not None:
+            self.state[:3] = np.maximum(self.state[:3], self.bounds_min)
+        if self.bounds_max is not None:
+            self.state[:3] = np.minimum(self.state[:3], self.bounds_max)
 
     def get_state(self) -> np.ndarray:
         return self.state.copy()
@@ -98,6 +142,7 @@ class Track:
     frames_since_last_detection: int = 0
     kalman: KalmanFilter3D | None = None
     consecutive_hits: int = 0
+    _consecutive_oob: int = 0  # consecutive out-of-bounds predictions
 
     @property
     def last_position(self) -> np.ndarray | None:
@@ -121,6 +166,14 @@ class TrackingConfig(BaseModel):
     kalman_q: float = 5.0
     kalman_r: float = 0.5
     dt: float = 0.1
+    # Bounds for Kalman position clamping (set from ROI)
+    bounds_min: list[float] | None = None
+    bounds_max: list[float] | None = None
+    max_velocity: float = 50.0  # m/s — physical limit for eagle
+    # Innovation gating: reject associations with Mahalanobis distance > this
+    innovation_gate: float = 5.0
+    # Kill track if Kalman predicts outside bounds for this many consecutive frames
+    max_oob_frames: int = 3
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +194,13 @@ class Tracker:
         for track in self._tracks:
             if track.state != TrackState.LOST and track.kalman:
                 track.kalman.predict()
+                # Check if prediction went out of bounds
+                if not track.kalman.is_position_in_bounds():
+                    track._consecutive_oob += 1
+                    if track._consecutive_oob >= self.config.max_oob_frames:
+                        track.state = TrackState.LOST
+                else:
+                    track._consecutive_oob = 0
 
         # Build cost matrix
         active_tracks = [t for t in self._tracks if t.state != TrackState.LOST]
@@ -151,19 +211,18 @@ class Tracker:
             return self.get_active_tracks()
 
         if n_tracks == 0:
-            # All detections start new tracks
             for det in detections:
                 self._create_track(det, frame_index)
             return self.get_active_tracks()
 
         if n_dets == 0:
-            # All tracks are missed
             for track in active_tracks:
                 self._miss_track(track)
             return self.get_active_tracks()
 
-        # Cost matrix: Euclidean distance between predicted position and detection centroid
+        # Cost matrix with innovation gating
         max_dist = self.config.max_association_distance
+        gate = self.config.innovation_gate
         cost = np.full((n_tracks + n_dets, n_dets + n_tracks), max_dist, dtype=np.float64)
 
         for i, track in enumerate(active_tracks):
@@ -171,10 +230,13 @@ class Tracker:
             if pred is None:
                 continue
             for j, det in enumerate(detections):
-                dist = np.linalg.norm(pred - det.centroid)
-                cost[i, j] = min(dist, max_dist)
-
-        # Dummy rows/cols already filled with max_dist
+                euclidean_dist = np.linalg.norm(pred - det.centroid)
+                # Innovation gating: also check Mahalanobis distance
+                if track.kalman and euclidean_dist < max_dist * 2:
+                    mahal = track.kalman.innovation_distance(det.centroid)
+                    if mahal > gate:
+                        continue  # Leave at max_dist — gated out
+                cost[i, j] = min(euclidean_dist, max_dist)
 
         row_ind, col_ind = linear_sum_assignment(cost)
 
@@ -200,7 +262,6 @@ class Tracker:
         # Enforce max tracks
         active = [t for t in self._tracks if t.state != TrackState.LOST]
         if len(active) > self.config.max_tracks:
-            # Keep the ones with longest history
             active.sort(key=lambda t: len(t.history), reverse=True)
             for t in active[self.config.max_tracks:]:
                 t.state = TrackState.LOST
@@ -208,11 +269,18 @@ class Tracker:
         return self.get_active_tracks()
 
     def _create_track(self, detection: VoxelCluster, frame_index: int) -> Track:
+        bounds_min = np.array(self.config.bounds_min) if self.config.bounds_min else None
+        bounds_max = np.array(self.config.bounds_max) if self.config.bounds_max else None
         track = Track(
             track_id=self._next_id,
             state=TrackState.TENTATIVE,
             kalman=KalmanFilter3D(
-                dt=self.config.dt, q=self.config.kalman_q, r=self.config.kalman_r
+                dt=self.config.dt,
+                q=self.config.kalman_q,
+                r=self.config.kalman_r,
+                max_velocity=self.config.max_velocity,
+                bounds_min=bounds_min,
+                bounds_max=bounds_max,
             ),
             consecutive_hits=1,
         )
@@ -228,6 +296,7 @@ class Tracker:
         track.history.append(TrackPoint(frame_index, detection.centroid.copy(), detection))
         track.frames_since_last_detection = 0
         track.consecutive_hits += 1
+        track._consecutive_oob = 0
 
         if track.state == TrackState.TENTATIVE and track.consecutive_hits >= self.config.min_hits_to_confirm:
             track.state = TrackState.CONFIRMED
