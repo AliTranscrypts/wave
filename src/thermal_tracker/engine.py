@@ -37,13 +37,13 @@ class SimulationResult:
 
 
 class SimulationEngine:
-    """Main simulation loop orchestrator."""
+    """Main simulation loop orchestrator. Supports 1 or more eagles."""
 
     def __init__(self, config: SimulationConfig):
         self.config = config
         self._cameras: list[Camera] = []
-        self._motion_gen: MotionGenerator | None = None
-        self._eagle_state: EagleState | None = None
+        self._motion_gens: list[MotionGenerator] = []
+        self._eagle_states: list[EagleState] = []
         self._frame_index: int = 0
         self._camera_rngs: list[np.random.Generator] = []
 
@@ -67,9 +67,20 @@ class SimulationEngine:
             seed=_seed_int(cam_seed),
         )
 
-        # Motion generator
-        self._motion_gen = create_motion_generator(self.config.eagle, self.config.world)
-        self._eagle_state = self._motion_gen.reset(_seed_int(motion_seed))
+        # Build eagles: use config.eagles list if populated, otherwise fall back to single config.eagle
+        eagle_configs = self.config.eagles if self.config.eagles else [self.config.eagle]
+        motion_ss = np.random.SeedSequence(_seed_int(motion_seed))
+        eagle_seeds = motion_ss.spawn(len(eagle_configs))
+
+        self._motion_gens = []
+        self._eagle_states = []
+        for i, ecfg in enumerate(eagle_configs):
+            gen = create_motion_generator(ecfg, self.config.world)
+            e_entropy = eagle_seeds[i].entropy
+            e_int = e_entropy if isinstance(e_entropy, int) else int(e_entropy[0])
+            state = gen.reset(e_int)
+            self._motion_gens.append(gen)
+            self._eagle_states.append(state)
 
         # Per-camera RNGs for noise
         cam_ss = np.random.SeedSequence(_seed_int(cam_seed))
@@ -82,36 +93,52 @@ class SimulationEngine:
     def cameras(self) -> list[Camera]:
         return self._cameras
 
+    @property
+    def num_eagles(self) -> int:
+        return len(self._eagle_states)
+
     def step_single(self) -> FrameBundle:
         """Advance simulation by one time step, return FrameBundle."""
         dt = self.config.run.dt
         timestamp = self._frame_index * dt
 
-        # Render all cameras
+        # Primary eagle is index 0, extra eagles are the rest
+        primary = self._eagle_states[0]
+        extra = self._eagle_states[1:] if len(self._eagle_states) > 1 else None
+
+        # Render all cameras with all eagles
         images = render_all_cameras(
-            self._eagle_state, self._cameras, self.config.rendering, self._camera_rngs
+            primary, self._cameras, self.config.rendering, self._camera_rngs,
+            extra_eagles=extra,
         )
 
-        # Ground truth 2D projections
+        # Ground truth 2D projections (for primary eagle, backward compat)
         gt_2d = {}
         vis = {}
         for cam in self._cameras:
-            proj = project_eagle(self._eagle_state, cam)
+            proj = project_eagle(primary, cam)
             gt_2d[cam.id] = proj["center_uv"]
             vis[cam.id] = proj["is_visible"]
+
+        # All eagle positions for multi-eagle GT
+        all_positions = [e.position.copy() for e in self._eagle_states]
+        all_velocities = [e.velocity.copy() for e in self._eagle_states]
 
         bundle = FrameBundle(
             timestamp=timestamp,
             frame_index=self._frame_index,
             camera_images=images,
-            ground_truth_3d=self._eagle_state.position.copy(),
-            ground_truth_velocity=self._eagle_state.velocity.copy(),
+            ground_truth_3d=primary.position.copy(),
+            ground_truth_velocity=primary.velocity.copy(),
             ground_truth_2d=gt_2d,
             visibility=vis,
+            all_eagle_positions=all_positions,
+            all_eagle_velocities=all_velocities,
         )
 
-        # Advance eagle state
-        self._eagle_state = self._motion_gen.step(self._eagle_state, dt)
+        # Advance ALL eagle states
+        for i in range(len(self._eagle_states)):
+            self._eagle_states[i] = self._motion_gens[i].step(self._eagle_states[i], dt)
         self._frame_index += 1
 
         return bundle

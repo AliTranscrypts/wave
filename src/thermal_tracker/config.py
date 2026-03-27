@@ -24,6 +24,7 @@ class SimulationConfig(BaseModel):
     """Top-level configuration composing all sub-configs."""
     world: WorldConfig = Field(default_factory=WorldConfig)
     eagle: EagleConfig = Field(default_factory=EagleConfig)
+    eagles: list[EagleConfig] = Field(default_factory=list)  # Multi-eagle support
     cameras: list[CameraConfig] = Field(default_factory=list)
     rendering: RenderingConfig = Field(default_factory=RenderingConfig)
     run: SimulationRunConfig = Field(default_factory=SimulationRunConfig)
