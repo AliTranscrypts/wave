@@ -64,8 +64,9 @@ class TrackingPipeline:
         images = list(frame_bundle.camera_images.values())
         frame_idx = frame_bundle.frame_index
 
-        # Determine search region from previous detection
-        search_region = self._get_search_region()
+        # Search region: use full ROI for multi-eagle, or narrow for single-eagle
+        # Full ROI at 140K voxels runs at ~56ms/frame — no need to narrow
+        search_region = None  # Always scan full ROI for multi-target support
 
         # Fusion
         if self.fusion_method == "space_carving":
@@ -113,25 +114,40 @@ class TrackingPipeline:
         )
 
     def _get_search_region(self) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
-        """Compute search region from last known track position."""
+        """Compute search region covering ALL confirmed tracks.
+
+        For multi-eagle: expands the region to the bounding box of all tracks + margin.
+        Returns None (full ROI scan) if no confirmed tracks exist.
+        """
         active = self.tracker.get_active_tracks()
         if not active:
             return None
 
-        # Use the primary track's predicted position
         confirmed = [t for t in active if t.state == TrackState.CONFIRMED]
         if not confirmed:
             return None
 
-        track = max(confirmed, key=lambda t: len(t.history))
-        pos = track.predicted_position
-        if pos is None:
+        # Collect all confirmed track positions
+        positions = []
+        for track in confirmed:
+            pos = track.predicted_position
+            if pos is not None:
+                positions.append(pos)
+
+        if not positions:
             return None
 
-        # Search margin: ~3x max speed * dt around predicted position
-        margin = 30.0  # meters
-        min_world = pos - margin
-        max_world = pos + margin
+        # Bounding box of all tracks + margin
+        positions = np.array(positions)
+        margin = 50.0  # meters — covers eagle movement + voxel size
+        min_world = positions.min(axis=0) - margin
+        max_world = positions.max(axis=0) + margin
+
+        # Clamp to ROI bounds so we don't search outside
+        roi_min = np.array(self.voxel_grid.config.roi_min)
+        roi_max = np.array(self.voxel_grid.config.roi_max)
+        min_world = np.maximum(min_world, roi_min)
+        max_world = np.minimum(max_world, roi_max)
 
         min_grid = self.voxel_grid.world_to_grid(min_world)
         max_grid = self.voxel_grid.world_to_grid(max_world)
