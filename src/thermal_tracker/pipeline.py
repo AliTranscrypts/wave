@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from thermal_tracker.camera import Camera
 from thermal_tracker.clustering import ClusteringConfig, VoxelCluster, cluster_occupied_voxels
 from thermal_tracker.engine import SimulationEngine
-from thermal_tracker.fusion import FusionConfig, SpaceCarvingConfig, fuse_frame, space_carve_frame, preprocess_thermal_image
+from thermal_tracker.fusion import FusionConfig, SpaceCarvingConfig, fuse_frame, space_carve_frame, preprocess_thermal_image, validate_clusters
 from thermal_tracker.rendering import FrameBundle
 from thermal_tracker.tracking import Track, TrackState, Tracker, TrackingConfig
 from thermal_tracker.voxel_grid import SparseVoxelGrid, VoxelGridConfig
@@ -64,13 +64,17 @@ class TrackingPipeline:
         images = list(frame_bundle.camera_images.values())
         frame_idx = frame_bundle.frame_index
 
-        # Search region: use full ROI for multi-eagle, or narrow for single-eagle
-        # Full ROI at 140K voxels runs at ~56ms/frame — no need to narrow
-        search_region = None  # Always scan full ROI for multi-target support
+        # Always scan full ROI for multi-target support
+        search_region = None
+
+        # Compute hot masks once (reused by fusion + ghost validation)
+        hot_masks = [preprocess_thermal_image(img, self.fusion_config) for img in images]
 
         # Fusion
         if self.fusion_method == "space_carving":
-            hot_masks = [preprocess_thermal_image(img, self.fusion_config) for img in images]
+            # Clear grid each frame for fresh carving — prevents ghost accumulation.
+            # Kalman filter in tracker provides temporal continuity.
+            self.voxel_grid.clear()
             space_carve_frame(
                 self.voxel_grid, self.cameras, hot_masks,
                 self.space_carving_config, frame_idx, search_region
@@ -80,14 +84,21 @@ class TrackingPipeline:
                 self.voxel_grid, self.cameras, images,
                 self.fusion_config, frame_idx, search_region
             )
-
-        # Decay and prune
-        self.voxel_grid.apply_temporal_decay(frame_idx)
-        if frame_idx % self._prune_interval == 0:
-            self.voxel_grid.prune()
+            # Decay and prune only for Bayesian (space carving resets each frame)
+            self.voxel_grid.apply_temporal_decay(frame_idx)
+            if frame_idx % self._prune_interval == 0:
+                self.voxel_grid.prune()
 
         # Cluster
         clusters = cluster_occupied_voxels(self.voxel_grid, self.clustering_config)
+
+        # Ghost suppression: validate cluster centroids by back-projection.
+        # Real eagle centroids project onto hot blobs in 3+ cameras.
+        # Ghost centroids (between eagles) project onto cold sky.
+        clusters = validate_clusters(
+            clusters, self.cameras, hot_masks,
+            min_cameras_confirm=max(3, len(self.cameras) // 4),
+        )
 
         # Track
         active_tracks = self.tracker.update(clusters, frame_idx)
