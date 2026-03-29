@@ -12,7 +12,7 @@ from pydantic import BaseModel, Field
 from thermal_tracker.camera import Camera
 from thermal_tracker.clustering import ClusteringConfig, VoxelCluster, cluster_occupied_voxels
 from thermal_tracker.engine import SimulationEngine
-from thermal_tracker.fusion import FusionConfig, SpaceCarvingConfig, fuse_frame, space_carve_frame, preprocess_thermal_image
+from thermal_tracker.fusion import FusionConfig, SpaceCarvingConfig, fuse_frame, space_carve_frame, preprocess_thermal_image, validate_clusters
 from thermal_tracker.rendering import FrameBundle
 from thermal_tracker.tracking import Track, TrackState, Tracker, TrackingConfig
 from thermal_tracker.voxel_grid import SparseVoxelGrid, VoxelGridConfig
@@ -64,12 +64,17 @@ class TrackingPipeline:
         images = list(frame_bundle.camera_images.values())
         frame_idx = frame_bundle.frame_index
 
-        # Determine search region from previous detection
-        search_region = self._get_search_region()
+        # Always scan full ROI for multi-target support
+        search_region = None
+
+        # Compute hot masks once (reused by fusion + ghost validation)
+        hot_masks = [preprocess_thermal_image(img, self.fusion_config) for img in images]
 
         # Fusion
         if self.fusion_method == "space_carving":
-            hot_masks = [preprocess_thermal_image(img, self.fusion_config) for img in images]
+            # Clear grid each frame for fresh carving — prevents ghost accumulation.
+            # Kalman filter in tracker provides temporal continuity.
+            self.voxel_grid.clear()
             space_carve_frame(
                 self.voxel_grid, self.cameras, hot_masks,
                 self.space_carving_config, frame_idx, search_region
@@ -79,14 +84,21 @@ class TrackingPipeline:
                 self.voxel_grid, self.cameras, images,
                 self.fusion_config, frame_idx, search_region
             )
-
-        # Decay and prune
-        self.voxel_grid.apply_temporal_decay(frame_idx)
-        if frame_idx % self._prune_interval == 0:
-            self.voxel_grid.prune()
+            # Decay and prune only for Bayesian (space carving resets each frame)
+            self.voxel_grid.apply_temporal_decay(frame_idx)
+            if frame_idx % self._prune_interval == 0:
+                self.voxel_grid.prune()
 
         # Cluster
         clusters = cluster_occupied_voxels(self.voxel_grid, self.clustering_config)
+
+        # Ghost suppression: validate cluster centroids by back-projection.
+        # Real eagle centroids project onto hot blobs in 3+ cameras.
+        # Ghost centroids (between eagles) project onto cold sky.
+        clusters = validate_clusters(
+            clusters, self.cameras, hot_masks,
+            min_cameras_confirm=max(3, len(self.cameras) // 4),
+        )
 
         # Track
         active_tracks = self.tracker.update(clusters, frame_idx)
@@ -113,25 +125,40 @@ class TrackingPipeline:
         )
 
     def _get_search_region(self) -> tuple[tuple[int, int, int], tuple[int, int, int]] | None:
-        """Compute search region from last known track position."""
+        """Compute search region covering ALL confirmed tracks.
+
+        For multi-eagle: expands the region to the bounding box of all tracks + margin.
+        Returns None (full ROI scan) if no confirmed tracks exist.
+        """
         active = self.tracker.get_active_tracks()
         if not active:
             return None
 
-        # Use the primary track's predicted position
         confirmed = [t for t in active if t.state == TrackState.CONFIRMED]
         if not confirmed:
             return None
 
-        track = max(confirmed, key=lambda t: len(t.history))
-        pos = track.predicted_position
-        if pos is None:
+        # Collect all confirmed track positions
+        positions = []
+        for track in confirmed:
+            pos = track.predicted_position
+            if pos is not None:
+                positions.append(pos)
+
+        if not positions:
             return None
 
-        # Search margin: ~3x max speed * dt around predicted position
-        margin = 30.0  # meters
-        min_world = pos - margin
-        max_world = pos + margin
+        # Bounding box of all tracks + margin
+        positions = np.array(positions)
+        margin = 50.0  # meters — covers eagle movement + voxel size
+        min_world = positions.min(axis=0) - margin
+        max_world = positions.max(axis=0) + margin
+
+        # Clamp to ROI bounds so we don't search outside
+        roi_min = np.array(self.voxel_grid.config.roi_min)
+        roi_max = np.array(self.voxel_grid.config.roi_max)
+        min_world = np.maximum(min_world, roi_min)
+        max_world = np.minimum(max_world, roi_max)
 
         min_grid = self.voxel_grid.world_to_grid(min_world)
         max_grid = self.voxel_grid.world_to_grid(max_world)

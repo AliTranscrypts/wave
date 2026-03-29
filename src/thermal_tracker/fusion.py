@@ -209,3 +209,38 @@ def space_carve_frame(
             if voxel is not None:
                 voxel.log_odds = config.empty_log_odds
                 voxel.last_updated_frame = current_frame
+
+
+# ---------------------------------------------------------------------------
+# Ghost suppression via back-projection validation
+# ---------------------------------------------------------------------------
+
+def validate_clusters(
+    clusters: list,
+    cameras: list[Camera],
+    hot_masks: list[np.ndarray],
+    min_cameras_confirm: int = 3,
+) -> list:
+    """Filter clusters by back-projecting centroids onto hot masks.
+
+    A real eagle's centroid projects onto a hot blob in many cameras.
+    A ghost's centroid (between eagles) projects onto cold sky in most cameras.
+
+    This is O(num_clusters * num_cameras) — negligible cost.
+    """
+    valid = []
+    for cluster in clusters:
+        centroid = cluster.centroid.reshape(1, 3)
+        hot_count = 0
+        for cam, mask in zip(cameras, hot_masks):
+            pixels, visible = cam.project(centroid)
+            if not visible[0]:
+                continue
+            u = int(round(pixels[0, 0]))
+            v = int(round(pixels[0, 1]))
+            H, W = mask.shape
+            if 0 <= u < W and 0 <= v < H and mask[v, u]:
+                hot_count += 1
+        if hot_count >= min_cameras_confirm:
+            valid.append(cluster)
+    return valid
