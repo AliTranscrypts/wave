@@ -131,7 +131,7 @@ def test_single_eagle_regression():
     config = SimulationConfig(
         eagle=EagleConfig(motion_type=MotionType.LISSAJOUS, lissajous_amplitudes=[100, 100, 20],
                           lissajous_frequencies=[0.1, 0.08, 0.05], lissajous_z_center=100),
-        cameras=generate_ring_placement(4, ring_radius=300, pole_height=10, hfov_deg=45),
+        cameras=generate_ring_placement(8, ring_radius=300, pole_height=10, hfov_deg=45),
         rendering=RenderingConfig(),
         run=SimulationRunConfig(num_frames=20, dt=0.1, random_seed=42),
     )
